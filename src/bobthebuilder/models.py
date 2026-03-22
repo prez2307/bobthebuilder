@@ -29,6 +29,19 @@ class MarkerFile(BaseModel):
     description: str
 
 
+class SubProject(BaseModel):
+    """An ecosystem detected in a subdirectory."""
+
+    path: str  # relative path from project root
+    ecosystem: Ecosystem
+    node_package_manager: str | None = None
+    node_scripts: list[str] = Field(default_factory=list)
+    python_tool: str | None = None
+    ruby_has_gemfile_lock: bool = False
+    env_example_files: list[str] = Field(default_factory=list)
+    has_docker_compose: bool = False
+
+
 class ProjectContext(BaseModel):
     """Everything we know about a project from scanning its directory."""
 
@@ -46,6 +59,10 @@ class ProjectContext(BaseModel):
     python_tool: str | None = None  # uv, poetry, pipenv, pip
     # Ruby-specific
     ruby_has_gemfile_lock: bool = False
+    # Ecosystems found at root level only (before subdir merging)
+    root_ecosystems: list[Ecosystem] = Field(default_factory=list)
+    # Subdirectory projects
+    subprojects: list[SubProject] = Field(default_factory=list)
 
 
 class BuildStep(BaseModel):

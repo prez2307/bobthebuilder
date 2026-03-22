@@ -6,7 +6,7 @@ from ..models import BuildStep, Ecosystem, ProjectContext, RiskLevel
 
 
 def get_steps(ctx: ProjectContext) -> list[BuildStep]:
-    if Ecosystem.RUBY not in ctx.ecosystems:
+    if Ecosystem.RUBY not in ctx.root_ecosystems:
         return []
 
     if ctx.ruby_has_gemfile_lock:

@@ -6,7 +6,7 @@ from ..models import BuildStep, Ecosystem, ProjectContext, RiskLevel
 
 
 def get_steps(ctx: ProjectContext) -> list[BuildStep]:
-    if Ecosystem.GO not in ctx.ecosystems:
+    if Ecosystem.GO not in ctx.root_ecosystems:
         return []
 
     return [

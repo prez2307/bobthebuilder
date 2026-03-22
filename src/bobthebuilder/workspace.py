@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +18,7 @@ class WorkspaceRepo:
     url: str | None = None
     detected_ecosystem: str | None = None
     detected_package_manager: str | None = None
+    custom_build_steps: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d: dict = {"path": self.path}
@@ -29,6 +31,8 @@ class WorkspaceRepo:
             detected["package_manager"] = self.detected_package_manager
         if detected:
             d["detected"] = detected
+        if self.custom_build_steps:
+            d["build_steps"] = self.custom_build_steps
         return d
 
     @classmethod
@@ -39,6 +43,7 @@ class WorkspaceRepo:
             url=data.get("url"),
             detected_ecosystem=detected.get("ecosystem"),
             detected_package_manager=detected.get("package_manager"),
+            custom_build_steps=data.get("build_steps", []),
         )
 
 
@@ -69,27 +74,61 @@ def _ecosystem_to_pm(ctx, primary: Ecosystem | None) -> str | None:
         return ctx.python_tool
     if primary == Ecosystem.RUBY:
         return "bundler"
-    # Go, Rust, Docker don't have a separate PM concept
     return None
 
 
 def _primary_ecosystem(ctx) -> Ecosystem | None:
     """Get the primary ecosystem (first non-Docker language ecosystem)."""
-    # Prefer language ecosystems over Docker
     for eco in ctx.ecosystems:
         if eco != Ecosystem.DOCKER:
             return eco
-    # If only Docker, return that
     if ctx.ecosystems:
         return ctx.ecosystems[0]
     return None
 
 
-def create_workspace(root: Path, repo_paths: list[Path]) -> Workspace:
-    """Create a workspace by detecting each repo."""
+def clone_repo(url: str, dest: Path) -> bool:
+    """Shallow-clone a git repo. Returns True on success or if already exists."""
+    if dest.exists():
+        return True
+    try:
+        result = subprocess.run(
+            ["git", "clone", "--depth=1", "--single-branch", url, str(dest)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def create_workspace(
+    root: Path,
+    repo_paths: list[Path] | None = None,
+    clone_urls: list[tuple[str, str]] | None = None,
+) -> Workspace:
+    """Create a workspace by detecting each repo.
+
+    Args:
+        root: Workspace root directory.
+        repo_paths: Local paths to repos.
+        clone_urls: List of (url, dirname) to clone into root.
+    """
+    repo_paths = repo_paths or []
+    clone_urls = clone_urls or []
     repos: list[WorkspaceRepo] = []
 
+    # Clone any URLs first
+    for url, dirname in clone_urls:
+        dest = root / dirname
+        clone_repo(url, dest)
+        if dest.exists():
+            repo_paths.append(dest)
+
     for repo_path in repo_paths:
+        if not repo_path.is_dir():
+            continue
         ctx = detect_project(repo_path)
         try:
             rel = str(repo_path.relative_to(root))

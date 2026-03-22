@@ -9,7 +9,7 @@ AUTO_RUN_SCRIPTS = {"build", "prepare"}
 
 
 def get_steps(ctx: ProjectContext) -> list[BuildStep]:
-    if Ecosystem.NODE not in ctx.ecosystems:
+    if Ecosystem.NODE not in ctx.root_ecosystems:
         return []
 
     steps: list[BuildStep] = []

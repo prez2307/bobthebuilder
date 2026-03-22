@@ -51,8 +51,11 @@ bob build --json       # structured output for AI agents
 ### Multi-Repo Workspace
 
 ```bash
-# Create a workspace (generates bob.yaml)
+# Create a workspace from local paths (generates bob.yaml)
 bob init ./frontend ./backend
+
+# Or clone from git URLs
+bob init https://github.com/org/frontend.git https://github.com/org/backend.git
 
 # Build everything
 bob build
@@ -60,8 +63,15 @@ bob build
 # Build one repo
 bob build frontend
 
+# Pull latest for all repos
+bob pull
+
 # Show workspace status
 bob status
+
+# Clean build artifacts (node_modules, .venv, target/, etc.)
+bob clean
+bob clean --dry-run  # preview what would be cleaned
 ```
 
 ### Generated bob.yaml
@@ -123,12 +133,17 @@ On failure:
 | Python (pip) | `requirements.txt` | `pip install -r requirements.txt` |
 | Go | `go.mod` | `go mod download && go build ./...` |
 | Rust | `Cargo.toml` | `cargo build` |
+| Ruby | `Gemfile` | `bundle install` |
 | Docker | `docker-compose.yml` | `docker compose up -d` (with `--docker`) |
 
 Also handles:
-- `.env.example` → `.env` copying
+- Subdirectory scanning (detects ecosystems in subdirs like `machine-learning/`, `frontend/`)
+- `.env.example` → `.env` copying (root and subdirectories)
 - `build` script detection in package.json
-- Makefile target detection
+- Makefile target auto-execution (`install`, `setup`, `deps`, `bootstrap`)
+- Custom `build_steps` override in bob.yaml
+- `bob clean` to remove node_modules, .venv, target/, __pycache__, dist/, etc.
+- `bob pull` to git pull all repos in a workspace
 
 ## Security
 
