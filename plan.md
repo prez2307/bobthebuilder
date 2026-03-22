@@ -1,139 +1,195 @@
-# bobthebuilder — Revised Plan
+# bobthebuilder — Plan v2
 
 ## Problem
-You clone a repo. You have to read the README, figure out if it's npm or pip or uv or poetry, run install commands, copy .env files, maybe run a build step. This takes 5-30 minutes and is pure friction.
+AI agents (Claude Code, Cursor, Copilot) are terrible at multi-repo development. When a feature spans a React frontend and a Python API (different repos, different ecosystems), the agent wastes tokens reading READMEs, guessing setup commands, retrying failures, and has no concept of how repos relate. There's no tool an agent can call to say "set up these repos so I can work across them."
 
-## Core Philosophy (revised)
-- **No AI API calls** — no Claude API, no OpenAI, no approval flows
-- **Fast** — detect and run in seconds, not minutes
-- **Local-first** — optionally use a small local model (ollama) for README parsing, but the 80% case should work with zero AI
-- **Zero config** — no bobthebuilder config needed in the target repo
-- **Just do it** — detect the ecosystem, run the right commands, done
+## Who is the user?
+**The primary user is an AI agent.** Bob is a tool that AI agents call to instantly bootstrap a multi-repo workspace. Humans can use it too, but the design optimizes for machine consumption:
+- Structured JSON output (not just pretty terminal output)
+- Deterministic, no interactive prompts
+- Fast — don't waste the agent's context window or wall-clock time
+- Exit codes and error messages that an agent can parse and act on
+
+Think of it as a lightweight Brazil Build — you declare your workspace, bob builds everything.
+
+## Core Philosophy
+- **Agent-first** — structured output, no interactivity, parseable errors
+- **Multi-repo native** — a workspace is the primary unit, not a single repo
+- **Fast** — heuristic detection, no AI API calls, seconds not minutes
+- **Zero config per repo** — repos don't need to know about bob; bob figures them out
+- **One config for the workspace** — `bob.yaml` declares which repos, bob detects how
 
 ## How It Works
-1. **Detect**: Scan for marker files (package.json, pyproject.toml, go.mod, Cargo.toml, etc.)
-2. **Plan**: Use hardcoded heuristics to pick the right commands (no AI needed for the common case)
-   - `package-lock.json` exists → `npm ci`
-   - `yarn.lock` exists → `yarn install`
-   - `uv.lock` exists → `uv sync`
-   - `pyproject.toml` + no lockfile → `uv sync` or `pip install -e .`
-   - `requirements.txt` → `pip install -r requirements.txt`
-   - `go.mod` → `go mod download`
-   - `Cargo.toml` → `cargo build`
-   - `.env.example` exists → copy to `.env` if `.env` doesn't exist
-   - `Makefile` with `install`/`setup`/`dev` target → run it
-3. **Execute**: Run the commands, stream output with nice formatting
-4. **Optional AI fallback**: If `--ai` flag is passed AND ollama is available, parse the README for non-obvious setup steps
+
+### 1. `bob init` — Create a workspace
+```bash
+bob init                                    # interactive: ask which repos
+bob init repo1 repo2 repo3                  # from local paths
+bob init git@github.com:org/fe.git git@github.com:org/api.git  # clone + detect
+```
+Scans each repo, detects ecosystems, generates `bob.yaml`:
+```yaml
+workspace: my-project
+repos:
+  - path: ./frontend
+    url: git@github.com:org/frontend.git
+    detected:
+      ecosystem: node
+      package_manager: npm
+  - path: ./backend
+    url: git@github.com:org/backend.git
+    detected:
+      ecosystem: python
+      tool: uv
+  - path: ./infra
+    url: git@github.com:org/infra.git
+    detected:
+      ecosystem: docker
+```
+
+### 2. `bob build` — Set up everything
+Reads `bob.yaml`, clones any missing repos, runs the right setup commands for each:
+```bash
+bob build              # build all repos in workspace
+bob build frontend     # build just one
+bob build --dry-run    # show plan as JSON, don't execute
+```
+
+### 3. `bob status` — What's the state of the workspace?
+```bash
+bob status             # JSON: which repos are cloned, built, up-to-date
+```
 
 ## CLI Interface
 ```
-bob                    # detect and set up current directory
-bob /path/to/repo      # set up a specific directory
-bob --dry-run          # show what would be done, don't execute
-bob --ai               # use local ollama model to parse README for extra steps
-bob --verbose          # show more detail
+bob init [repos...]          # create workspace, detect ecosystems
+bob build [repo] [--dry-run] # install deps + build, all or one repo
+bob status                   # workspace state (JSON-friendly)
+bob clean                    # remove build artifacts, node_modules, venvs
 ```
 
+### Output Modes
+- Default: human-readable Rich output (colors, spinners, panels)
+- `--json`: structured JSON for AI agent consumption
+- `--quiet`: minimal output, just errors
+
+## Agent Integration
+An AI agent would use bob like this:
+```
+# Agent clones repos and runs:
+bob init ./frontend ./backend
+bob build --json
+
+# Output:
+{
+  "success": true,
+  "repos": [
+    {"path": "./frontend", "ecosystem": "node", "status": "ready", "duration_s": 3.2},
+    {"path": "./backend", "ecosystem": "python", "status": "ready", "duration_s": 1.1}
+  ],
+  "total_duration_s": 4.3
+}
+```
+
+If something fails:
+```json
+{
+  "success": false,
+  "repos": [
+    {"path": "./frontend", "ecosystem": "node", "status": "failed",
+     "error": "npm ci failed: missing peer dependency react@18",
+     "command": ["npm", "ci"],
+     "exit_code": 1,
+     "stderr": "..."}
+  ]
+}
+```
+
+The agent gets structured error info and can decide what to do — no token-wasting README parsing.
+
 ## Tech Stack
-- **Python** with `uv` for project management
+- **Python** with `uv` for our own project management
 - **Typer** for CLI
-- **Rich** for terminal output (spinners, colors, panels)
-- No required external AI dependencies — ollama is optional
+- **Rich** for human-friendly terminal output
+- **Pydantic** for models + JSON serialization
+- No external AI dependencies
 
 ## Project Structure
 ```
 src/bobthebuilder/
   __init__.py
-  cli.py           # Typer CLI entrypoint
-  detector.py      # Scan for marker files, produce ProjectContext
-  planner.py       # Heuristic-based plan generation (no AI)
-  executor.py      # Run commands with streaming output
-  models.py        # Pydantic data models
-  ai.py            # Optional ollama integration for README parsing
+  cli.py              # Typer CLI entrypoint (init, build, status, clean)
+  models.py           # Pydantic data models
+  detector.py         # Scan a single repo for marker files
+  workspace.py        # Multi-repo workspace management (bob.yaml)
+  executor.py         # Run commands with streaming output + JSON capture
+  output.py           # Output formatting (human vs JSON)
   strategies/
-    __init__.py
-    node.py        # Node.js setup strategy
-    python.py      # Python setup strategy
-    go.py          # Go setup strategy
-    rust.py        # Rust setup strategy
-    docker.py      # Docker compose strategy
-    make.py        # Makefile strategy
-    env.py         # .env file handling
+    __init__.py        # Strategy registry
+    node.py            # Node.js: npm/yarn/pnpm/bun detection + install
+    python.py          # Python: uv/poetry/pipenv/pip detection + install
+    go.py              # Go: go mod download + build
+    rust.py            # Rust: cargo build
+    docker.py          # Docker compose up
+    env.py             # .env.example → .env copying
 tests/
   test_detector.py
-  test_planner.py
+  test_workspace.py
   test_strategies.py
+  test_executor.py
 ```
 
-## Detection → Strategy Mapping
-Each ecosystem has a **strategy** that knows how to generate the right BuildSteps:
+## Detection Heuristics (per repo)
 
-### Node Strategy
-- Detect package manager from lockfile: npm (package-lock.json), yarn (yarn.lock), pnpm (pnpm-lock.yaml), bun (bun.lockb)
-- If no lockfile, check for `packageManager` field in package.json, fall back to npm
-- Run install command
-- Check for `build` script in package.json, run if present
-- Check for `prepare` / `postinstall` scripts
+### Node.js
+- Lockfile detection: package-lock.json→npm, yarn.lock→yarn, pnpm-lock.yaml→pnpm, bun.lockb→bun
+- Fallback: `packageManager` field in package.json, then default npm
+- Commands: `npm ci` / `yarn install --frozen-lockfile` / `pnpm install --frozen-lockfile` / `bun install`
+- If `build` script exists in package.json: run it after install
 
-### Python Strategy
-- Priority order: uv.lock → poetry.lock → Pipfile.lock → requirements.txt → pyproject.toml → setup.py
-- If uv.lock: `uv sync`
-- If poetry.lock: `poetry install`
-- If Pipfile.lock: `pipenv install`
-- If requirements.txt: detect if uv available → `uv pip install -r requirements.txt` else `pip install -r requirements.txt`
-- If pyproject.toml (no lock): try `uv sync`, fall back to `pip install -e .`
-- Create virtualenv if needed
+### Python
+- Priority: uv.lock→`uv sync`, poetry.lock→`poetry install`, Pipfile.lock→`pipenv install`
+- Fallback: requirements.txt→`pip install -r requirements.txt`, pyproject.toml→`pip install -e .`
+- Prefer uv over pip when uv is available on PATH
 
-### Go Strategy
-- `go mod download` then `go build ./...`
+### Go
+- go.mod→`go mod download && go build ./...`
 
-### Rust Strategy
-- `cargo build`
+### Rust
+- Cargo.toml→`cargo build`
 
-### Docker Strategy
-- If docker-compose.yml exists: `docker compose up -d` (only with --docker flag, since this is heavier)
+### Docker
+- docker-compose.yml / compose.yml→`docker compose up -d` (only with `--docker` flag)
 
-### Make Strategy
-- Look for common targets: `install`, `setup`, `dev`, `deps`, `dependencies`, `bootstrap`
-- Run the first matching target
+### Env files
+- .env.example / .env.sample / .env.template→copy to .env if .env doesn't exist
 
-### Env Strategy
-- Copy `.env.example` → `.env` (if .env doesn't already exist)
-- Same for `.env.sample`, `.env.template`
+## Execution Order (per repo)
+1. Clone (if URL provided and path doesn't exist)
+2. Copy env templates
+3. Install dependencies (npm/pip/cargo/go)
+4. Build (if applicable)
 
-## Execution Order
-1. Env files (copy templates)
-2. Language-specific dependency installation (npm/pip/etc)
-3. Build steps (if detected)
-4. Makefile targets (if not already covered)
-5. Docker (only with --docker)
-
-## Security (simplified)
-- Never run `sudo` anything
-- Never run `curl | sh` or `wget | bash`
-- Only run known commands from a hardcoded allowlist
-- If --ai mode produces unknown commands, show them but don't auto-execute
+## Security
+- Only run commands from a hardcoded allowlist
+- Never run sudo, curl|sh, wget|bash
 - Never read or transmit .env file contents
+- Validate all paths are within workspace root (no traversal)
 
-## Output Style
-```
-🔍 Detected: Node.js (npm), Python (uv)
-
-📋 Plan:
-  1. Copy .env.example → .env
-  2. npm ci
-  3. uv sync
-
-🚀 Running...
-  ✓ Copied .env.example → .env
-  ✓ npm ci (3.2s)
-  ✓ uv sync (1.1s)
-
-✅ Project ready! (4.3s total)
+## bob.yaml Schema
+```yaml
+workspace: string           # workspace name
+repos:                      # list of repos
+  - path: string            # relative path from bob.yaml
+    url: string | null      # git clone URL (optional)
+    detected:               # auto-populated by bob init
+      ecosystem: string     # node, python, go, rust, docker
+      package_manager: string | null  # npm, yarn, uv, poetry, etc.
+    build_steps: []          # override: custom commands (optional)
 ```
 
 ## Dependencies
 - typer >= 0.15.0
 - rich >= 13.0.0
 - pydantic >= 2.0.0
-- (optional) ollama for --ai mode
+- pyyaml >= 6.0.0
