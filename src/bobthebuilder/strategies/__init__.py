@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..models import BuildStep, ProjectContext
-from . import docker, env, go, node, python, rust
+from . import docker, env, go, node, python, ruby, rust
 
 
 def get_steps_for_context(ctx: ProjectContext, docker_flag: bool = False) -> list[BuildStep]:
@@ -18,6 +18,7 @@ def get_steps_for_context(ctx: ProjectContext, docker_flag: bool = False) -> lis
     steps.extend(python.get_steps(ctx))
     steps.extend(go.get_steps(ctx))
     steps.extend(rust.get_steps(ctx))
+    steps.extend(ruby.get_steps(ctx))
 
     # 3. Docker (only if explicitly requested)
     steps.extend(docker.get_steps(ctx, docker=docker_flag))

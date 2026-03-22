@@ -117,6 +117,27 @@ class TestPythonDetection:
         assert ctx.python_tool == "uv"
 
 
+# --- Ruby detection ---
+
+
+class TestRubyDetection:
+    def test_detects_gemfile(self, tmp_project):
+        root = tmp_project({"Gemfile": 'source "https://rubygems.org"\ngem "rails"'})
+        ctx = detect_project(root)
+        assert Ecosystem.RUBY in ctx.ecosystems
+
+    def test_detects_gemfile_lock(self, tmp_project):
+        root = tmp_project({"Gemfile": "", "Gemfile.lock": ""})
+        ctx = detect_project(root)
+        assert Ecosystem.RUBY in ctx.ecosystems
+        assert ctx.ruby_has_gemfile_lock is True
+
+    def test_no_gemfile_lock(self, tmp_project):
+        root = tmp_project({"Gemfile": ""})
+        ctx = detect_project(root)
+        assert ctx.ruby_has_gemfile_lock is False
+
+
 # --- Go detection ---
 
 
@@ -145,11 +166,20 @@ class TestDockerDetection:
         root = tmp_project({"docker-compose.yml": "version: '3'"})
         ctx = detect_project(root)
         assert ctx.has_docker_compose
+        assert Ecosystem.DOCKER in ctx.ecosystems
 
     def test_detects_compose_yaml(self, tmp_project):
         root = tmp_project({"compose.yaml": "services:"})
         ctx = detect_project(root)
         assert ctx.has_docker_compose
+        assert Ecosystem.DOCKER in ctx.ecosystems
+
+    def test_dockerfile_only_no_docker_ecosystem(self, tmp_project):
+        """Dockerfile alone shouldn't add Docker to ecosystems."""
+        root = tmp_project({"Dockerfile": "FROM node:18"})
+        ctx = detect_project(root)
+        assert Ecosystem.DOCKER not in ctx.ecosystems
+        assert ctx.has_docker_compose is False
 
 
 # --- Env file detection ---

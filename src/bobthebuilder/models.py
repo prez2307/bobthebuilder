@@ -12,6 +12,7 @@ class Ecosystem(str, Enum):
     PYTHON = "python"
     GO = "go"
     RUST = "rust"
+    RUBY = "ruby"
     DOCKER = "docker"
     MAKE = "make"
 
@@ -43,6 +44,8 @@ class ProjectContext(BaseModel):
     node_scripts: list[str] = Field(default_factory=list)
     # Python-specific
     python_tool: str | None = None  # uv, poetry, pipenv, pip
+    # Ruby-specific
+    ruby_has_gemfile_lock: bool = False
 
 
 class BuildStep(BaseModel):

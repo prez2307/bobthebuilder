@@ -36,6 +36,10 @@ MARKERS: list[tuple[str, Ecosystem, str]] = [
     ("docker-compose.yaml", Ecosystem.DOCKER, "Docker Compose config"),
     ("compose.yml", Ecosystem.DOCKER, "Docker Compose config"),
     ("compose.yaml", Ecosystem.DOCKER, "Docker Compose config"),
+    ("Gemfile", Ecosystem.RUBY, "Ruby Gemfile"),
+    ("Gemfile.lock", Ecosystem.RUBY, "Ruby Gemfile lockfile"),
+    (".ruby-version", Ecosystem.RUBY, "Ruby version file"),
+    ("Rakefile", Ecosystem.RUBY, "Rake build file"),
     ("Makefile", Ecosystem.MAKE, "Makefile"),
     ("makefile", Ecosystem.MAKE, "Makefile"),
 ]
@@ -167,11 +171,18 @@ def detect_project(path: str | Path) -> ProjectContext:
         if readme_content is not None:
             break
 
-    # Remove MAKE and DOCKER from reported ecosystems (they're cross-cutting)
+    # Remove MAKE from reported ecosystems (cross-cutting build tool)
+    # Keep DOCKER only if docker-compose exists (not just Dockerfile)
     reported_ecosystems = sorted(
-        [e for e in ecosystems if e not in (Ecosystem.MAKE, Ecosystem.DOCKER)],
+        [e for e in ecosystems if e != Ecosystem.MAKE],
         key=lambda e: e.value,
     )
+    # Only include Docker if there's a compose file
+    if Ecosystem.DOCKER in reported_ecosystems and not has_docker_compose:
+        reported_ecosystems = [e for e in reported_ecosystems if e != Ecosystem.DOCKER]
+
+    # Ruby detection
+    ruby_has_gemfile_lock = (root / "Gemfile.lock").exists()
 
     return ProjectContext(
         root=str(root),
@@ -184,4 +195,5 @@ def detect_project(path: str | Path) -> ProjectContext:
         node_package_manager=_detect_node_pm(root),
         node_scripts=_detect_node_scripts(root),
         python_tool=_detect_python_tool(root),
+        ruby_has_gemfile_lock=ruby_has_gemfile_lock,
     )

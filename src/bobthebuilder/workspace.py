@@ -61,19 +61,27 @@ class Workspace:
         }
 
 
-def _ecosystem_to_pm(ctx) -> str | None:
-    """Get the detected package manager name from a ProjectContext."""
-    if Ecosystem.NODE in ctx.ecosystems:
+def _ecosystem_to_pm(ctx, primary: Ecosystem | None) -> str | None:
+    """Get the package manager for the primary ecosystem."""
+    if primary == Ecosystem.NODE:
         return ctx.node_package_manager
-    if Ecosystem.PYTHON in ctx.ecosystems:
+    if primary == Ecosystem.PYTHON:
         return ctx.python_tool
+    if primary == Ecosystem.RUBY:
+        return "bundler"
+    # Go, Rust, Docker don't have a separate PM concept
     return None
 
 
-def _primary_ecosystem(ctx) -> str | None:
-    """Get the primary ecosystem name from a ProjectContext."""
+def _primary_ecosystem(ctx) -> Ecosystem | None:
+    """Get the primary ecosystem (first non-Docker language ecosystem)."""
+    # Prefer language ecosystems over Docker
+    for eco in ctx.ecosystems:
+        if eco != Ecosystem.DOCKER:
+            return eco
+    # If only Docker, return that
     if ctx.ecosystems:
-        return ctx.ecosystems[0].value
+        return ctx.ecosystems[0]
     return None
 
 
@@ -88,11 +96,12 @@ def create_workspace(root: Path, repo_paths: list[Path]) -> Workspace:
         except ValueError:
             rel = str(repo_path)
 
+        primary = _primary_ecosystem(ctx)
         repos.append(
             WorkspaceRepo(
                 path=f"./{rel}",
-                detected_ecosystem=_primary_ecosystem(ctx),
-                detected_package_manager=_ecosystem_to_pm(ctx),
+                detected_ecosystem=primary.value if primary else None,
+                detected_package_manager=_ecosystem_to_pm(ctx, primary),
             )
         )
 

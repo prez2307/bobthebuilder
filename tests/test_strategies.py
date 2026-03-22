@@ -152,6 +152,44 @@ class TestRustStrategy:
         assert ["cargo", "build"] in commands
 
 
+# --- Ruby strategies ---
+
+
+class TestRubyStrategy:
+    def test_bundle_install(self, tmp_project):
+        root = tmp_project({"Gemfile": 'gem "rails"', "Gemfile.lock": ""})
+        ctx = detect_project(root)
+        steps = get_steps_for_context(ctx)
+        commands = [s.command for s in steps]
+        assert ["bundle", "install"] in commands
+
+    def test_bundle_install_no_lock(self, tmp_project):
+        root = tmp_project({"Gemfile": 'gem "sinatra"'})
+        ctx = detect_project(root)
+        steps = get_steps_for_context(ctx)
+        commands = [s.command for s in steps]
+        assert ["bundle", "install"] in commands
+
+
+# --- Docker strategies ---
+
+
+class TestDockerStrategy:
+    def test_docker_compose_with_flag(self, tmp_project):
+        root = tmp_project({"docker-compose.yml": "version: '3'\nservices:\n  db:\n    image: postgres"})
+        ctx = detect_project(root)
+        steps = get_steps_for_context(ctx, docker_flag=True)
+        commands = [s.command for s in steps]
+        assert ["docker", "compose", "up", "-d"] in commands
+
+    def test_docker_compose_without_flag(self, tmp_project):
+        root = tmp_project({"docker-compose.yml": "version: '3'"})
+        ctx = detect_project(root)
+        steps = get_steps_for_context(ctx, docker_flag=False)
+        commands = [s.command for s in steps]
+        assert ["docker", "compose", "up", "-d"] not in commands
+
+
 # --- Env strategies ---
 
 
