@@ -24,6 +24,12 @@ app = typer.Typer(
     no_args_is_help=False,
 )
 
+worktree_app = typer.Typer(
+    name="worktree",
+    help="Manage git worktrees across workspace repos.",
+)
+app.add_typer(worktree_app, name="worktree")
+
 
 def _find_bob_yaml(start: Path) -> Path | None:
     """Walk up from start looking for bob.yaml."""
@@ -285,6 +291,211 @@ def pull(
             out.info(f"  [green]✓[/green] {name}: {r.message}")
         else:
             out.info(f"  [red]✗[/red] {name}: {r.message}")
+
+
+@app.command()
+def run(
+    repo: Optional[str] = typer.Argument(None, help="Run a specific repo (by path or name)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show detected run command without executing"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
+) -> None:
+    """Detect and run the application."""
+    from .runner import detect_run_command, run_app
+
+    out = Output(json_mode=json_output, quiet=quiet)
+    cwd = Path.cwd()
+
+    bob_yaml = _find_bob_yaml(cwd)
+
+    if bob_yaml:
+        ws = load_workspace(bob_yaml)
+        ws_root = bob_yaml.parent
+
+        if repo:
+            # Run a specific repo
+            matches = [r for r in ws.repos if repo in r.path or repo == Path(r.path).name]
+            if not matches:
+                out.error(f"Repo '{repo}' not found in workspace")
+                raise typer.Exit(1)
+            target_path = (ws_root / matches[0].path).resolve()
+        elif len(ws.repos) == 1:
+            target_path = (ws_root / ws.repos[0].path).resolve()
+        else:
+            # Multiple repos — show what's available
+            configs = []
+            for ws_repo in ws.repos:
+                rp = (ws_root / ws_repo.path).resolve()
+                if rp.is_dir():
+                    config = detect_run_command(rp)
+                    if config:
+                        configs.append((ws_repo.path, config))
+
+            if json_output:
+                print(json.dumps({
+                    "configs": [{"repo": p, **c.to_dict()} for p, c in configs],
+                }, indent=2))
+                return
+
+            if not configs:
+                out.error("No runnable projects detected. Specify a repo with 'bob run <repo>'.")
+                raise typer.Exit(1)
+
+            out.info("[bold]Runnable projects:[/bold]")
+            for repo_path, config in configs:
+                name = Path(repo_path).name
+                out.info(f"  [cyan]{name}[/cyan]: {config.description}")
+            out.info("\nRun a specific repo: [bold]bob run <repo-name>[/bold]")
+            return
+    else:
+        target_path = cwd
+
+    if not target_path.is_dir():
+        out.error(f"Directory not found: {target_path}")
+        raise typer.Exit(1)
+
+    config = detect_run_command(target_path)
+    if not config:
+        out.error(f"Could not detect how to run {target_path.name}. No known run script or entry point found.")
+        raise typer.Exit(1)
+
+    cmd_str = " ".join(config.command)
+
+    if dry_run:
+        if json_output:
+            print(json.dumps(config.to_dict(), indent=2))
+        else:
+            out.info(f"[bold]{target_path.name}[/bold] [dim]({config.ecosystem})[/dim]")
+            out.info(f"  Would run: [cyan]{cmd_str}[/cyan]")
+        return
+
+    if not quiet and not json_output:
+        out.info(f"[bold]{target_path.name}[/bold] [dim]({config.ecosystem})[/dim]")
+        out.info(f"  [bold blue]>[/bold blue] {cmd_str}")
+
+    exit_code = run_app(config)
+    if exit_code != 0:
+        raise typer.Exit(exit_code)
+
+
+# --- Worktree subcommands ---
+
+
+@worktree_app.command("create")
+def worktree_create(
+    branch: str = typer.Argument(..., help="Branch name for the worktrees"),
+    repo: Optional[str] = typer.Argument(None, help="Specific repo (by name). Omit for all repos."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
+) -> None:
+    """Create worktrees for workspace repos on a branch."""
+    from .worktree import create_worktrees
+
+    out = Output(json_mode=json_output, quiet=quiet)
+    repo_paths = _get_worktree_repo_paths(out, repo)
+
+    results = create_worktrees(repo_paths, branch)
+
+    if json_output:
+        print(json.dumps({"results": [r.to_dict() for r in results]}, indent=2))
+        return
+
+    for r in results:
+        if r.success:
+            out.info(f"  [green]✓[/green] {r.repo}: {r.message}")
+            if r.worktree_path:
+                out.info(f"    [dim]{r.worktree_path}[/dim]")
+        else:
+            out.info(f"  [red]✗[/red] {r.repo}: {r.message}")
+
+    if any(not r.success for r in results):
+        raise typer.Exit(1)
+
+
+@worktree_app.command("list")
+def worktree_list(
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
+) -> None:
+    """List worktrees for all workspace repos."""
+    from .worktree import list_worktrees
+
+    out = Output(json_mode=json_output, quiet=quiet)
+    repo_paths = _get_worktree_repo_paths(out)
+
+    results = list_worktrees(repo_paths)
+
+    if json_output:
+        print(json.dumps({"results": [r.to_dict() for r in results]}, indent=2))
+        return
+
+    for r in results:
+        if not r.success:
+            out.info(f"  [red]✗[/red] {r.repo}: {r.message}")
+            continue
+        out.info(f"  [bold]{r.repo}[/bold]")
+        for wt in r.worktrees:
+            branch = wt.branch or "(detached)"
+            short_commit = wt.commit[:8] if wt.commit else ""
+            out.info(f"    [cyan]{branch}[/cyan] [dim]{short_commit}[/dim] {wt.path}")
+
+
+@worktree_app.command("remove")
+def worktree_remove(
+    branch: str = typer.Argument(..., help="Branch name of worktrees to remove"),
+    repo: Optional[str] = typer.Argument(None, help="Specific repo (by name). Omit for all repos."),
+    force: bool = typer.Option(False, "--force", "-f", help="Force removal even with uncommitted changes"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
+) -> None:
+    """Remove worktrees for a branch across workspace repos."""
+    from .worktree import remove_worktrees
+
+    out = Output(json_mode=json_output, quiet=quiet)
+    repo_paths = _get_worktree_repo_paths(out, repo)
+
+    results = remove_worktrees(repo_paths, branch, force=force)
+
+    if json_output:
+        print(json.dumps({"results": [r.to_dict() for r in results]}, indent=2))
+        return
+
+    for r in results:
+        if r.success:
+            out.info(f"  [green]✓[/green] {r.repo}: {r.message}")
+        else:
+            out.info(f"  [red]✗[/red] {r.repo}: {r.message}")
+
+    if any(not r.success for r in results):
+        raise typer.Exit(1)
+
+
+def _get_worktree_repo_paths(out: Output, repo: str | None = None) -> list[Path]:
+    """Get repo paths from workspace, optionally filtering to a specific repo."""
+    cwd = Path.cwd()
+    bob_yaml = _find_bob_yaml(cwd)
+    if not bob_yaml:
+        out.error("No bob.yaml found. Run 'bob init' first.")
+        raise typer.Exit(1)
+
+    ws = load_workspace(bob_yaml)
+    ws_root = bob_yaml.parent
+
+    if repo:
+        matches = [
+            r for r in ws.repos
+            if repo in r.path or repo == Path(r.path).name
+        ]
+        if not matches:
+            out.error(f"Repo '{repo}' not found in workspace")
+            raise typer.Exit(1)
+        return [(ws_root / m.path).resolve() for m in matches]
+
+    return [
+        (ws_root / r.path).resolve()
+        for r in ws.repos
+        if (ws_root / r.path).resolve().is_dir()
+    ]
 
 
 @app.callback(invoke_without_command=True)
