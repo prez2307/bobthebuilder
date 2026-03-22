@@ -19,6 +19,7 @@ dependencies = [
     "typer>=0.15.0",
     "rich>=13.0.0",
     "pydantic>=2.0.0",
+    "pyyaml>=6.0.0",
 ]
 
 [project.scripts]
@@ -34,6 +35,9 @@ packages = ["src/bobthebuilder"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "integration: tests that clone real repos from GitHub (deselect with '-m not integration')",
+]
 
 [dependency-groups]
 dev = [
