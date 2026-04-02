@@ -119,6 +119,9 @@ def build(
     repo: Optional[str] = typer.Argument(None, help="Build a specific repo (by path)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show plan without executing"),
     docker: bool = typer.Option(False, "--docker", help="Include Docker Compose services"),
+    parallel: bool = typer.Option(False, "--parallel", "-p", help="Build repos in parallel"),
+    incremental: bool = typer.Option(False, "--incremental", "-i", help="Skip repos with unchanged lockfiles"),
+    stream: bool = typer.Option(False, "--stream", help="Output NDJSON events (streaming)"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
 ) -> None:
@@ -126,11 +129,23 @@ def build(
     out = Output(json_mode=json_output, quiet=quiet)
     cwd = Path.cwd()
 
+    streamer = None
+    if stream:
+        from .streaming import StreamingOutput
+        streamer = StreamingOutput()
+
     bob_yaml = _find_bob_yaml(cwd)
 
     if bob_yaml:
         ws = load_workspace(bob_yaml)
         ws_root = bob_yaml.parent
+
+        # Load cache for incremental builds
+        cache = None
+        if incremental:
+            from .cache import BuildCache
+            cache = BuildCache.load(ws_root)
+
         repos_to_build = ws.repos
         if repo:
             repos_to_build = [r for r in ws.repos if repo in r.path]
@@ -138,35 +153,194 @@ def build(
                 out.error(f"Repo '{repo}' not found in workspace")
                 raise typer.Exit(1)
 
-        all_results = []
+        # Resolve build order from dependency graph
+        repos_to_build = _resolve_build_order(repos_to_build, ws)
+
+        if streamer:
+            streamer.emit_workspace_start(ws.name, [r.path for r in repos_to_build])
+
         total_start = time.monotonic()
 
-        for ws_repo in repos_to_build:
-            repo_path = (ws_root / ws_repo.path).resolve()
-            if not repo_path.is_dir():
-                out.error(f"Repo path not found: {ws_repo.path}")
-                continue
-
-            # Use custom build steps if defined
-            if ws_repo.custom_build_steps:
-                results = _run_custom_steps(ws_repo, repo_path, out, dry_run)
-            else:
-                results = _build_single_repo(repo_path, out, dry_run, docker)
-            all_results.extend(results)
+        if parallel and len(repos_to_build) > 1:
+            all_results = _build_parallel(
+                repos_to_build, ws_root, ws, out, dry_run, docker, cache, streamer,
+            )
+        else:
+            all_results = _build_sequential(
+                repos_to_build, ws_root, out, dry_run, docker, cache, streamer,
+            )
 
         total_duration = time.monotonic() - total_start
-        out.summary(all_results, total_duration)
+
+        # Save cache
+        if cache:
+            cache.save(ws_root)
+
+        if streamer:
+            streamer.emit_workspace_done(ws.name, all(r.success for r in all_results), total_duration)
+        else:
+            out.summary(all_results, total_duration)
 
         if any(not r.success for r in all_results):
             raise typer.Exit(1)
     else:
         total_start = time.monotonic()
-        results = _build_single_repo(cwd, out, dry_run, docker)
+        results = _build_single_repo(cwd, out, dry_run, docker, streamer=streamer)
         total_duration = time.monotonic() - total_start
-        out.summary(results, total_duration)
+
+        if not streamer:
+            out.summary(results, total_duration)
 
         if any(not r.success for r in results):
             raise typer.Exit(1)
+
+
+@app.command()
+def test(
+    repo: Optional[str] = typer.Argument(None, help="Test a specific repo (by path or name)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show detected test command without executing"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
+) -> None:
+    """Detect and run tests."""
+    from .tester import detect_test_command
+
+    out = Output(json_mode=json_output, quiet=quiet)
+    cwd = Path.cwd()
+    bob_yaml = _find_bob_yaml(cwd)
+
+    if bob_yaml:
+        ws = load_workspace(bob_yaml)
+        ws_root = bob_yaml.parent
+
+        if repo:
+            matches = [r for r in ws.repos if repo in r.path or repo == Path(r.path).name]
+            if not matches:
+                out.error(f"Repo '{repo}' not found in workspace")
+                raise typer.Exit(1)
+            target_path = (ws_root / matches[0].path).resolve()
+        elif len(ws.repos) == 1:
+            target_path = (ws_root / ws.repos[0].path).resolve()
+        else:
+            # Show all testable repos
+            configs = []
+            for ws_repo in ws.repos:
+                rp = (ws_root / ws_repo.path).resolve()
+                if rp.is_dir():
+                    config = detect_test_command(rp)
+                    if config:
+                        configs.append((ws_repo.path, config))
+
+            if json_output:
+                print(json.dumps({
+                    "configs": [{"repo": p, **c.to_dict()} for p, c in configs],
+                }, indent=2))
+                return
+
+            if not configs:
+                out.error("No testable projects detected.")
+                raise typer.Exit(1)
+
+            out.info("[bold]Testable projects:[/bold]")
+            for repo_path, config in configs:
+                name = Path(repo_path).name
+                out.info(f"  [cyan]{name}[/cyan]: {config.description}")
+            out.info("\nRun tests for a specific repo: [bold]bob test <repo-name>[/bold]")
+            return
+    else:
+        target_path = cwd
+
+    if not target_path.is_dir():
+        out.error(f"Directory not found: {target_path}")
+        raise typer.Exit(1)
+
+    config = detect_test_command(target_path)
+    if not config:
+        out.error(f"Could not detect test command for {target_path.name}.")
+        raise typer.Exit(1)
+
+    cmd_str = " ".join(config.command)
+
+    if dry_run:
+        if json_output:
+            print(json.dumps(config.to_dict(), indent=2))
+        else:
+            out.info(f"[bold]{target_path.name}[/bold] [dim]({config.ecosystem})[/dim]")
+            out.info(f"  Would run: [cyan]{cmd_str}[/cyan]")
+        return
+
+    if not quiet and not json_output:
+        out.info(f"[bold]{target_path.name}[/bold] [dim]({config.ecosystem})[/dim]")
+        out.info(f"  [bold blue]>[/bold blue] {cmd_str}")
+
+    # Run tests using the runner's streaming approach
+    from .runner import RunConfig, run_app
+
+    run_config = RunConfig(
+        path=config.path,
+        command=config.command,
+        description=config.description,
+        ecosystem=config.ecosystem,
+    )
+    exit_code = run_app(run_config)
+    if exit_code != 0:
+        raise typer.Exit(exit_code)
+
+
+@app.command()
+def doctor(
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
+) -> None:
+    """Check tool versions and environment health."""
+    from .doctor import check_repo
+
+    out = Output(json_mode=json_output, quiet=quiet)
+    cwd = Path.cwd()
+
+    bob_yaml = _find_bob_yaml(cwd)
+    results = []
+
+    if bob_yaml:
+        ws = load_workspace(bob_yaml)
+        ws_root = bob_yaml.parent
+        for ws_repo in ws.repos:
+            repo_path = (ws_root / ws_repo.path).resolve()
+            if repo_path.is_dir():
+                results.append(check_repo(repo_path))
+    else:
+        results.append(check_repo(cwd))
+
+    if json_output:
+        all_healthy = all(r.healthy for r in results)
+        print(json.dumps({
+            "healthy": all_healthy,
+            "results": [r.to_dict() for r in results],
+        }, indent=2))
+        if not all_healthy:
+            raise typer.Exit(1)
+        return
+
+    for r in results:
+        status = "[green]healthy[/green]" if r.healthy else "[red]unhealthy[/red]"
+        out.info(f"  [bold]{r.repo}[/bold] [dim]({r.ecosystem})[/dim] {status}")
+
+        for check in r.checks:
+            if check.installed:
+                version_info = f"[dim]{check.version}[/dim]"
+                wanted = ""
+                if check.wanted_version:
+                    wanted = f" [yellow](wants {check.wanted_version})[/yellow]"
+                out.info(f"    [green]✓[/green] {check.name} {version_info}{wanted}")
+            else:
+                req = " [red](required)[/red]" if check.required else " [dim](optional)[/dim]"
+                out.info(f"    [red]✗[/red] {check.name} not found{req}")
+
+        for warning in r.warnings:
+            out.info(f"    [yellow]![/yellow] {warning}")
+
+    if any(not r.healthy for r in results):
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -180,6 +354,21 @@ def status(
     bob_yaml = _find_bob_yaml(cwd)
     if bob_yaml:
         ws = load_workspace(bob_yaml)
+
+        if json_output:
+            from .monorepo import detect_monorepo
+            status_data: dict = ws.to_dict()
+            # Add monorepo info
+            ws_root = bob_yaml.parent
+            for i, ws_repo in enumerate(ws.repos):
+                repo_path = (ws_root / ws_repo.path).resolve()
+                if repo_path.is_dir():
+                    mono = detect_monorepo(repo_path)
+                    if mono:
+                        status_data["repos"][i]["monorepo"] = mono.to_dict()
+            print(json.dumps(status_data, indent=2))
+            return
+
         detection_info = [
             (r.path, r.detected_ecosystem or "unknown", r.detected_package_manager)
             for r in ws.repos
@@ -378,6 +567,15 @@ def run(
         raise typer.Exit(exit_code)
 
 
+@app.command()
+def mcp(
+) -> None:
+    """Start MCP server for AI agent tool integration."""
+    from .mcp_server import create_mcp_server
+    server = create_mcp_server()
+    server.run_stdio()
+
+
 # --- Worktree subcommands ---
 
 
@@ -511,7 +709,10 @@ def main(
         build()
 
 
-def _build_single_repo(repo_path: Path, out: Output, dry_run: bool, docker: bool):
+# --- Internal build helpers ---
+
+
+def _build_single_repo(repo_path: Path, out: Output, dry_run: bool, docker: bool, streamer=None):
     """Detect and build a single repo. Returns list of ExecutionResults."""
     ctx = detect_project(repo_path)
 
@@ -529,15 +730,32 @@ def _build_single_repo(repo_path: Path, out: Output, dry_run: bool, docker: bool
     out.info(f"[bold]{repo_path.name}[/bold] [dim]({eco_names})[/dim]")
     out.plan(steps)
 
+    if streamer:
+        streamer.emit_build_start(repo_path.name, len(steps))
+
     results = []
     for step in steps:
         out.step_start(step)
+        if streamer:
+            streamer.emit_step_start(repo_path.name, step.name, step.command)
         result = execute_step(step, cwd=step.working_dir or str(repo_path), dry_run=dry_run)
         out.step_done(result)
+        if streamer:
+            streamer.emit_step_done(
+                repo_path.name, step.name, result.success, result.duration_s,
+                result.exit_code, result.error,
+            )
         results.append(result)
 
         if not result.success and not dry_run:
             break
+
+    if streamer:
+        streamer.emit_build_done(
+            repo_path.name,
+            all(r.success for r in results),
+            sum(r.duration_s for r in results),
+        )
 
     return results
 
@@ -568,6 +786,151 @@ def _run_custom_steps(ws_repo: WorkspaceRepo, repo_path: Path, out: Output, dry_
             break
 
     return results
+
+
+def _run_hooks(ws_repo: WorkspaceRepo, repo_path: Path, phase: str, timing: str, out: Output, dry_run: bool):
+    """Run pre/post hooks for a phase. Returns list of ExecutionResults."""
+    from .hooks import HookConfig, run_hook
+
+    hook_config = HookConfig.from_dict(ws_repo.hooks)
+    pre, post = hook_config.get_hooks(phase)
+
+    command = pre if timing == "pre" else post
+    if not command:
+        return []
+
+    hook_name = f"{timing}_{phase}"
+    out.info(f"  [dim]hook: {hook_name}[/dim]")
+    result = run_hook(hook_name, command, cwd=str(repo_path), dry_run=dry_run)
+    out.step_done(result)
+    return [result]
+
+
+def _build_sequential(repos_to_build, ws_root, out, dry_run, docker, cache, streamer):
+    """Build repos sequentially."""
+    from .executor import ExecutionResult
+
+    all_results: list[ExecutionResult] = []
+
+    for ws_repo in repos_to_build:
+        repo_path = (ws_root / ws_repo.path).resolve()
+        if not repo_path.is_dir():
+            out.error(f"Repo path not found: {ws_repo.path}")
+            continue
+
+        # Incremental: skip if unchanged
+        if cache and cache.is_up_to_date(repo_path, ws_repo.detected_ecosystem):
+            out.info(f"[dim]Skipping {repo_path.name} (unchanged)[/dim]")
+            if streamer:
+                streamer.emit_cache_hit(repo_path.name)
+            continue
+
+        # Pre-build hooks
+        hook_results = _run_hooks(ws_repo, repo_path, "build", "pre", out, dry_run)
+        all_results.extend(hook_results)
+        if hook_results and not hook_results[0].success and not dry_run:
+            continue
+
+        # Build
+        if ws_repo.custom_build_steps:
+            results = _run_custom_steps(ws_repo, repo_path, out, dry_run)
+        else:
+            results = _build_single_repo(repo_path, out, dry_run, docker, streamer=streamer)
+        all_results.extend(results)
+
+        # Post-build hooks
+        if all(r.success for r in results):
+            hook_results = _run_hooks(ws_repo, repo_path, "build", "post", out, dry_run)
+            all_results.extend(hook_results)
+
+        # Record in cache
+        if cache:
+            success = all(r.success for r in results)
+            cache.record_build(repo_path, ws_repo.detected_ecosystem, success)
+
+    return all_results
+
+
+def _build_parallel(repos_to_build, ws_root, ws, out, dry_run, docker, cache, streamer):
+    """Build repos in parallel using thread pool."""
+    from .parallel import build_repos_parallel
+
+    tasks = []
+    for ws_repo in repos_to_build:
+        repo_path = (ws_root / ws_repo.path).resolve()
+        if not repo_path.is_dir():
+            continue
+
+        if cache and cache.is_up_to_date(repo_path, ws_repo.detected_ecosystem):
+            out.info(f"[dim]Skipping {repo_path.name} (unchanged)[/dim]")
+            if streamer:
+                streamer.emit_cache_hit(repo_path.name)
+            continue
+
+        # Create a closure for this repo's build
+        def make_build_fn(wr=ws_repo, rp=repo_path):
+            def build_fn():
+                silent_out = Output(json_mode=True, quiet=True)
+                if wr.custom_build_steps:
+                    return _run_custom_steps(wr, rp, silent_out, dry_run)
+                return _build_single_repo(rp, silent_out, dry_run, docker)
+            return build_fn
+
+        tasks.append((repo_path.name, repo_path, make_build_fn()))
+
+    if not tasks:
+        return []
+
+    repo_results = build_repos_parallel(tasks)
+
+    # Flatten and report
+    from .executor import ExecutionResult
+    all_results: list[ExecutionResult] = []
+    for rr in repo_results:
+        status = "[green]✓[/green]" if rr.success else "[red]✗[/red]"
+        out.info(f"  {status} {rr.repo_name} [dim]({rr.duration_s:.1f}s)[/dim]")
+        all_results.extend(rr.results)
+
+        # Record in cache
+        if cache:
+            ws_repo = next((r for r in repos_to_build if Path(r.path).name == rr.repo_name), None)
+            if ws_repo:
+                cache.record_build(
+                    Path(rr.repo_path),
+                    ws_repo.detected_ecosystem,
+                    rr.success,
+                )
+
+    return all_results
+
+
+def _resolve_build_order(repos: list[WorkspaceRepo], ws: Workspace) -> list[WorkspaceRepo]:
+    """Resolve build order based on depends_on graph."""
+    has_deps = any(r.depends_on for r in repos)
+    if not has_deps:
+        return repos
+
+    from .graph import build_dep_graph
+
+    graph_input = [(r.path, r.depends_on) for r in repos]
+    graph = build_dep_graph(graph_input)
+
+    try:
+        ordered_names = graph.topological_sort()
+    except ValueError:
+        # Cycle detected — fall back to original order
+        return repos
+
+    name_to_repo = {Path(r.path).name: r for r in repos}
+    ordered = [name_to_repo[n] for n in ordered_names if n in name_to_repo]
+
+    # Add any repos not in the graph (shouldn't happen, but safety)
+    seen = {Path(r.path).name for r in ordered}
+    for r in repos:
+        if Path(r.path).name not in seen:
+            ordered.append(r)
+
+    return ordered
 
 
 def _looks_like_project(path: Path) -> bool:

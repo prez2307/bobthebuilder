@@ -19,6 +19,8 @@ class WorkspaceRepo:
     detected_ecosystem: str | None = None
     detected_package_manager: str | None = None
     custom_build_steps: list[dict] = field(default_factory=list)
+    hooks: dict = field(default_factory=dict)
+    depends_on: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d: dict = {"path": self.path}
@@ -33,6 +35,10 @@ class WorkspaceRepo:
             d["detected"] = detected
         if self.custom_build_steps:
             d["build_steps"] = self.custom_build_steps
+        if self.hooks:
+            d["hooks"] = self.hooks
+        if self.depends_on:
+            d["depends_on"] = self.depends_on
         return d
 
     @classmethod
@@ -44,6 +50,8 @@ class WorkspaceRepo:
             detected_ecosystem=detected.get("ecosystem"),
             detected_package_manager=detected.get("package_manager"),
             custom_build_steps=data.get("build_steps", []),
+            hooks=data.get("hooks", {}),
+            depends_on=data.get("depends_on", []),
         )
 
 
