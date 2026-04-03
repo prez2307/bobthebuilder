@@ -290,27 +290,58 @@ def test(
 
 @app.command()
 def doctor(
+    fix: bool = typer.Option(False, "--fix", help="Attempt to install missing tools"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
 ) -> None:
-    """Check tool versions and environment health."""
-    from .doctor import check_repo
+    """Check tool versions and environment health. Use --fix to auto-install."""
+    from .doctor import check_repo, fix_repo
 
     out = Output(json_mode=json_output, quiet=quiet)
     cwd = Path.cwd()
 
     bob_yaml = _find_bob_yaml(cwd)
-    results = []
+    repo_paths: list[Path] = []
 
     if bob_yaml:
         ws = load_workspace(bob_yaml)
         ws_root = bob_yaml.parent
         for ws_repo in ws.repos:
-            repo_path = (ws_root / ws_repo.path).resolve()
-            if repo_path.is_dir():
-                results.append(check_repo(repo_path))
+            rp = (ws_root / ws_repo.path).resolve()
+            if rp.is_dir():
+                repo_paths.append(rp)
     else:
-        results.append(check_repo(cwd))
+        repo_paths.append(cwd)
+
+    if fix:
+        fix_results = [fix_repo(rp) for rp in repo_paths]
+
+        if json_output:
+            print(json.dumps({
+                "all_fixed": all(fr.all_fixed for fr in fix_results),
+                "results": [fr.to_dict() for fr in fix_results],
+            }, indent=2))
+            if not all(fr.all_fixed for fr in fix_results):
+                raise typer.Exit(1)
+            return
+
+        for fr in fix_results:
+            out.info(f"  [bold]{fr.repo}[/bold]")
+            for action in fr.fixes:
+                if action.success:
+                    out.info(f"    [green]✓[/green] {action.tool}: {action.message}")
+                else:
+                    out.info(f"    [red]✗[/red] {action.tool}: {action.message}")
+                    if action.command:
+                        out.info(f"      tried: {' '.join(action.command)}")
+            if fr.still_broken:
+                out.info(f"    Still need: {', '.join(fr.still_broken)}")
+
+        if any(not fr.all_fixed for fr in fix_results):
+            raise typer.Exit(1)
+        return
+
+    results = [check_repo(rp) for rp in repo_paths]
 
     if json_output:
         all_healthy = all(r.healthy for r in results)
@@ -713,7 +744,7 @@ def main(
 # --- Internal build helpers ---
 
 
-def _build_single_repo(repo_path: Path, out: Output, dry_run: bool, docker: bool, streamer=None):
+def _build_single_repo(repo_path: Path, out: Output, dry_run: bool, docker: bool, streamer=None, timeout: int | None = None):
     """Detect and build a single repo. Returns list of ExecutionResults."""
     ctx = detect_project(repo_path)
 
@@ -739,7 +770,7 @@ def _build_single_repo(repo_path: Path, out: Output, dry_run: bool, docker: bool
         out.step_start(step)
         if streamer:
             streamer.emit_step_start(repo_path.name, step.name, step.command)
-        result = execute_step(step, cwd=step.working_dir or str(repo_path), dry_run=dry_run)
+        result = execute_step(step, cwd=step.working_dir or str(repo_path), dry_run=dry_run, timeout=timeout)
         out.step_done(result)
         if streamer:
             streamer.emit_step_done(
@@ -836,7 +867,7 @@ def _build_sequential(repos_to_build, ws_root, out, dry_run, docker, cache, stre
         if ws_repo.custom_build_steps:
             results = _run_custom_steps(ws_repo, repo_path, out, dry_run)
         else:
-            results = _build_single_repo(repo_path, out, dry_run, docker, streamer=streamer)
+            results = _build_single_repo(repo_path, out, dry_run, docker, streamer=streamer, timeout=ws_repo.timeout)
         all_results.extend(results)
 
         # Post-build hooks

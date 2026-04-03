@@ -1,4 +1,4 @@
-"""Doctor - diagnose tool versions and environment health."""
+"""Doctor - diagnose tool versions and environment health, with auto-fix."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from .detector import detect_project
 from .models import Ecosystem
 
 
-# Map of ecosystem -> list of (tool_name, version_args, version_file)
+# Map of ecosystem -> list of (tool_name, version_args)
 TOOL_CHECKS: dict[str, list[tuple[str, list[str]]]] = {
     "node": [
         ("node", ["node", "--version"]),
@@ -44,7 +44,6 @@ TOOL_CHECKS: dict[str, list[tuple[str, list[str]]]] = {
     ],
 }
 
-# Tools that are required vs optional per ecosystem
 REQUIRED_TOOLS: dict[str, set[str]] = {
     "node": {"node"},
     "python": {"python"},
@@ -54,12 +53,30 @@ REQUIRED_TOOLS: dict[str, set[str]] = {
     "docker": {"docker"},
 }
 
-# Version files per ecosystem
 VERSION_FILES: dict[str, list[tuple[str, str]]] = {
     "node": [(".nvmrc", "node"), (".node-version", "node")],
     "python": [(".python-version", "python")],
     "ruby": [(".ruby-version", "ruby")],
     "rust": [("rust-toolchain.toml", "rustc"), ("rust-toolchain", "rustc")],
+}
+
+# Install commands for missing tools — safe, commonly available installers
+INSTALL_COMMANDS: dict[str, list[str]] = {
+    "pnpm": ["npm", "install", "-g", "pnpm"],
+    "yarn": ["npm", "install", "-g", "yarn"],
+    "bun": ["npm", "install", "-g", "bun"],
+    "uv": ["pip3", "install", "uv"],
+    "poetry": ["pip3", "install", "poetry"],
+    "pipenv": ["pip3", "install", "pipenv"],
+    "bundler": ["gem", "install", "bundler"],
+}
+
+# Tools that can update themselves to a specific version
+VERSION_INSTALL_COMMANDS: dict[str, str] = {
+    "node": "nvm install {version}",
+    "python": "pyenv install {version}",
+    "ruby": "rbenv install {version}",
+    "rustc": "rustup default {version}",
 }
 
 
@@ -236,6 +253,151 @@ def check_repo(repo_path: Path) -> DoctorResult:
                 result.warnings.append("No virtual environment found — consider using 'uv' or 'poetry'")
 
     return result
+
+
+@dataclass
+class FixAction:
+    """A fix that was attempted."""
+
+    tool: str
+    command: list[str]
+    success: bool
+    message: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "tool": self.tool,
+            "command": self.command,
+            "success": self.success,
+            "message": self.message,
+        }
+
+
+@dataclass
+class FixResult:
+    """Result of doctor --fix for a repo."""
+
+    repo: str
+    fixes: list[FixAction] = field(default_factory=list)
+    still_broken: list[str] = field(default_factory=list)
+
+    @property
+    def all_fixed(self) -> bool:
+        return len(self.still_broken) == 0
+
+    def to_dict(self) -> dict:
+        return {
+            "repo": self.repo,
+            "all_fixed": self.all_fixed,
+            "fixes": [f.to_dict() for f in self.fixes],
+            "still_broken": self.still_broken,
+        }
+
+
+def fix_repo(repo_path: Path) -> FixResult:
+    """Attempt to fix missing tools for a repo."""
+    doctor_result = check_repo(repo_path)
+    fix_result = FixResult(repo=repo_path.name)
+
+    for check in doctor_result.checks:
+        if check.installed:
+            continue
+        if not check.required:
+            continue
+
+        # Try to install the missing tool
+        install_cmd = INSTALL_COMMANDS.get(check.name)
+        if install_cmd:
+            action = _try_install(check.name, install_cmd)
+            fix_result.fixes.append(action)
+            if not action.success:
+                fix_result.still_broken.append(check.name)
+        else:
+            # Can't auto-install — provide guidance
+            hint = _install_hint(check.name)
+            fix_result.fixes.append(FixAction(
+                tool=check.name,
+                command=[],
+                success=False,
+                message=hint,
+            ))
+            fix_result.still_broken.append(check.name)
+
+    # Handle docker compose for services
+    ctx = detect_project(repo_path)
+    if ctx.has_docker_compose:
+        compose_running = _check_docker_services(repo_path)
+        if not compose_running:
+            fix_result.fixes.append(FixAction(
+                tool="docker-services",
+                command=["docker", "compose", "up", "-d"],
+                success=False,
+                message="Docker services not running. Run 'docker compose up -d' to start them.",
+            ))
+
+    return fix_result
+
+
+def _try_install(tool_name: str, command: list[str]) -> FixAction:
+    """Attempt to install a tool."""
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode == 0:
+            # Verify it's now available
+            return FixAction(
+                tool=tool_name,
+                command=command,
+                success=True,
+                message=f"Installed {tool_name}",
+            )
+        return FixAction(
+            tool=tool_name,
+            command=command,
+            success=False,
+            message=result.stderr.strip()[:200] or f"Install failed with exit code {result.returncode}",
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return FixAction(
+            tool=tool_name,
+            command=command,
+            success=False,
+            message=str(e),
+        )
+
+
+def _install_hint(tool_name: str) -> str:
+    """Return a human-readable install hint for a tool that can't be auto-installed."""
+    hints = {
+        "node": "Install Node.js: https://nodejs.org/ or use 'nvm install --lts'",
+        "python": "Install Python: https://python.org/ or use 'pyenv install 3.12'",
+        "go": "Install Go: https://go.dev/dl/ or use 'brew install go'",
+        "cargo": "Install Rust: https://rustup.rs/ — run 'curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh'",
+        "rustc": "Install Rust: https://rustup.rs/",
+        "ruby": "Install Ruby: https://ruby-lang.org/ or use 'rbenv install'",
+        "docker": "Install Docker: https://docs.docker.com/get-docker/",
+        "npm": "npm comes with Node.js — install Node first",
+    }
+    return hints.get(tool_name, f"Install {tool_name} manually")
+
+
+def _check_docker_services(repo_path: Path) -> bool:
+    """Check if docker compose services are running."""
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "ps", "--status=running", "-q"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return bool(result.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
 
 
 def _tools_needed_for_repo(ctx) -> set[str]:

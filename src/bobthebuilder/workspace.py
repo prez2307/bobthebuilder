@@ -21,6 +21,7 @@ class WorkspaceRepo:
     custom_build_steps: list[dict] = field(default_factory=list)
     hooks: dict = field(default_factory=dict)
     depends_on: list[str] = field(default_factory=list)
+    timeout: int | None = None  # per-repo timeout in seconds
 
     def to_dict(self) -> dict:
         d: dict = {"path": self.path}
@@ -39,6 +40,8 @@ class WorkspaceRepo:
             d["hooks"] = self.hooks
         if self.depends_on:
             d["depends_on"] = self.depends_on
+        if self.timeout:
+            d["timeout"] = self.timeout
         return d
 
     @classmethod
@@ -52,6 +55,7 @@ class WorkspaceRepo:
             custom_build_steps=data.get("build_steps", []),
             hooks=data.get("hooks", {}),
             depends_on=data.get("depends_on", []),
+            timeout=data.get("timeout"),
         )
 
 

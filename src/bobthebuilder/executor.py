@@ -104,10 +104,14 @@ def validate_command(command: list[str]) -> bool:
     return False
 
 
+DEFAULT_TIMEOUT = 300  # 5 minutes
+
+
 def execute_step(
     step: BuildStep,
     cwd: str | None = None,
     dry_run: bool = False,
+    timeout: int | None = None,
 ) -> ExecutionResult:
     """Execute a single build step."""
     if not validate_command(step.command):
@@ -125,6 +129,8 @@ def execute_step(
             command=step.command,
         )
 
+    step_timeout = timeout or DEFAULT_TIMEOUT
+
     start = time.monotonic()
     try:
         result = subprocess.run(
@@ -132,7 +138,7 @@ def execute_step(
             cwd=cwd or step.working_dir,
             capture_output=True,
             text=True,
-            timeout=300,  # 5 minute timeout per step
+            timeout=step_timeout,
         )
         duration = time.monotonic() - start
         return ExecutionResult(
@@ -150,7 +156,7 @@ def execute_step(
             step_name=step.name,
             success=False,
             exit_code=-1,
-            error="Command timed out after 300 seconds",
+            error=f"Command timed out after {step_timeout} seconds",
             duration_s=duration,
             command=step.command,
         )
