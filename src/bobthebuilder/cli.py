@@ -703,6 +703,81 @@ def run(
 
 
 @app.command()
+def validate(
+    base: str = typer.Option("HEAD", "--base", "-b", help="Git base ref to diff against (default: HEAD for uncommitted changes)"),
+    parallel: bool = typer.Option(True, "--parallel/--sequential", help="Run checks in parallel"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
+) -> None:
+    """Run lint + typecheck + tests for affected code only. Fast feedback loop."""
+    from .affected import detect_affected, detect_affected_from_diff
+    from .validate import run_validation
+
+    out = Output(json_mode=json_output, quiet=quiet)
+    cwd = Path.cwd()
+
+    bob_yaml = _find_bob_yaml(cwd)
+    ws_root = bob_yaml.parent if bob_yaml else cwd
+
+    # Detect what changed
+    if base == "HEAD":
+        affected = detect_affected_from_diff(ws_root)
+    else:
+        affected = detect_affected(ws_root, base=base)
+
+    if not affected.affected_apps:
+        if json_output:
+            print(json.dumps({"success": True, "skip_reason": affected.skip_reason or "Nothing affected"}))
+        else:
+            out.info(f"[dim]{affected.skip_reason or 'No changes detected — nothing to validate'}[/dim]")
+        return
+
+    if not quiet and not json_output:
+        out.info(f"[bold]Changed files:[/bold] {len(affected.changed_files)}")
+        out.info(f"[bold]Affected apps:[/bold] {', '.join(affected.affected_apps)}")
+        out.info("")
+
+    # Collect test env from workspace
+    test_env: dict[str, str] = {}
+    if bob_yaml:
+        ws = load_workspace(bob_yaml)
+        for r in ws.repos:
+            if r.test_env:
+                test_env.update(r.test_env)
+
+    # Run validation
+    result = run_validation(
+        ws_root,
+        affected.affected_apps,
+        test_env=test_env,
+        parallel=parallel,
+    )
+
+    if json_output:
+        output = result.to_dict()
+        output["changed_files"] = affected.changed_files
+        print(json.dumps(output, indent=2))
+        if not result.success:
+            raise typer.Exit(1)
+        return
+
+    for check in result.checks:
+        status = "[green]✓[/green]" if check.success else "[red]✗[/red]"
+        out.info(f"  {status} {check.app}/{check.name} [dim]({check.duration_s:.1f}s)[/dim]")
+        if not check.success and check.stderr:
+            for line in check.stderr.strip().splitlines()[:5]:
+                out.info(f"    [dim]{line}[/dim]")
+
+    out.info("")
+    if result.success:
+        out.info(f"[bold green]All checks passed[/bold green] [dim]({result.total_duration_s:.1f}s)[/dim]")
+    else:
+        failed = [c for c in result.checks if not c.success]
+        out.info(f"[bold red]{len(failed)} check(s) failed[/bold red] [dim]({result.total_duration_s:.1f}s)[/dim]")
+        raise typer.Exit(1)
+
+
+@app.command()
 def mcp(
 ) -> None:
     """Start MCP server for AI agent tool integration."""
