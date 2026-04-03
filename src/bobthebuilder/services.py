@@ -173,12 +173,23 @@ def start_services(
     for svc in services:
         container = _container_name(svc.name)
 
-        # Check if already running
+        # Check if the port is already open (service running natively or in another container)
+        if svc.port and _is_port_open(svc.port):
+            results.append(ServiceResult(
+                name=svc.name,
+                success=True,
+                message=f"Already running on port {svc.port}",
+                port=svc.port,
+                env_vars=svc.test_env,
+            ))
+            continue
+
+        # Check if bob's container is already running
         if _is_container_running(container):
             results.append(ServiceResult(
                 name=svc.name,
                 success=True,
-                message="Already running",
+                message="Container already running",
                 port=svc.port,
                 env_vars=svc.test_env,
             ))
