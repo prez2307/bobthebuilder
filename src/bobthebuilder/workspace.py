@@ -22,6 +22,8 @@ class WorkspaceRepo:
     hooks: dict = field(default_factory=dict)
     depends_on: list[str] = field(default_factory=list)
     timeout: int | None = None  # per-repo timeout in seconds
+    services: list = field(default_factory=list)  # services needed for tests
+    test_env: dict = field(default_factory=dict)  # env vars for test runs
 
     def to_dict(self) -> dict:
         d: dict = {"path": self.path}
@@ -42,6 +44,10 @@ class WorkspaceRepo:
             d["depends_on"] = self.depends_on
         if self.timeout:
             d["timeout"] = self.timeout
+        if self.services:
+            d["services"] = self.services
+        if self.test_env:
+            d["test_env"] = self.test_env
         return d
 
     @classmethod
@@ -56,6 +62,8 @@ class WorkspaceRepo:
             hooks=data.get("hooks", {}),
             depends_on=data.get("depends_on", []),
             timeout=data.get("timeout"),
+            services=data.get("services", []),
+            test_env=data.get("test_env", {}),
         )
 
 

@@ -198,16 +198,19 @@ def build(
 @app.command()
 def test(
     repo: Optional[str] = typer.Argument(None, help="Test a specific repo (by path or name)"),
+    with_services: bool = typer.Option(False, "--with-services", "-s", help="Start required services before tests"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show detected test command without executing"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
 ) -> None:
-    """Detect and run tests."""
+    """Detect and run tests. Use --with-services to start Postgres, Redis, etc."""
     from .tester import detect_all_test_commands, detect_test_command
 
     out = Output(json_mode=json_output, quiet=quiet)
     cwd = Path.cwd()
     bob_yaml = _find_bob_yaml(cwd)
+
+    ws_repo_match: WorkspaceRepo | None = None
 
     if bob_yaml:
         ws = load_workspace(bob_yaml)
@@ -218,8 +221,10 @@ def test(
             if not matches:
                 out.error(f"Repo '{repo}' not found in workspace")
                 raise typer.Exit(1)
+            ws_repo_match = matches[0]
             target_path = (ws_root / matches[0].path).resolve()
         elif len(ws.repos) == 1:
+            ws_repo_match = ws.repos[0]
             target_path = (ws_root / ws.repos[0].path).resolve()
         else:
             # Show all testable repos (including subproject ecosystems)
@@ -243,8 +248,15 @@ def test(
             out.info("[bold]Testable projects:[/bold]")
             for repo_path, config in configs:
                 name = Path(repo_path).name
-                out.info(f"  [cyan]{name}[/cyan]: {config.description}")
-            out.info("\nRun tests for a specific repo: [bold]bob test <repo-name>[/bold]")
+                svc_hint = ""
+                # Show if repo has services configured
+                matching_repo = next((r for r in ws.repos if r.path == repo_path), None)
+                if matching_repo and matching_repo.services:
+                    svc_names = [s if isinstance(s, str) else s.get("name", "?") for s in matching_repo.services]
+                    svc_hint = f" [dim](services: {', '.join(svc_names)})[/dim]"
+                out.info(f"  [cyan]{name}[/cyan]: {config.description}{svc_hint}")
+            out.info("\nRun tests: [bold]bob test <repo-name>[/bold]")
+            out.info("With services: [bold]bob test <repo-name> --with-services[/bold]")
             return
     else:
         target_path = cwd
@@ -262,28 +274,119 @@ def test(
     cmd_str = " ".join(config.command)
 
     if dry_run:
+        result_data: dict = {"configs": [c.to_dict() for c in all_configs]}
+        if ws_repo_match and ws_repo_match.services:
+            from .services import parse_services, collect_test_env
+            svcs = parse_services(ws_repo_match.services)
+            result_data["services"] = [s.to_dict() for s in svcs]
+            result_data["test_env"] = {**collect_test_env(svcs), **ws_repo_match.test_env}
         if json_output:
-            print(json.dumps({"configs": [c.to_dict() for c in all_configs]}, indent=2))
+            print(json.dumps(result_data, indent=2))
         else:
             for c in all_configs:
                 out.info(f"[bold]{Path(c.path).name}[/bold] [dim]({c.ecosystem})[/dim]")
                 out.info(f"  Would run: [cyan]{' '.join(c.command)}[/cyan]")
+            if ws_repo_match and ws_repo_match.services:
+                from .services import parse_services
+                svcs = parse_services(ws_repo_match.services)
+                out.info(f"\n[bold]Services:[/bold]")
+                for s in svcs:
+                    out.info(f"  [cyan]{s.name}[/cyan] ({s.image or 'compose'}) port {s.port or '?'}")
         return
 
-    if not quiet and not json_output:
-        out.info(f"[bold]{target_path.name}[/bold] [dim]({config.ecosystem})[/dim]")
-        out.info(f"  [bold blue]>[/bold blue] {cmd_str}")
+    # --- Service lifecycle ---
+    services_started = False
+    service_env: dict[str, str] = {}
 
-    # Run tests using the runner's streaming approach
-    from .runner import RunConfig, run_app
+    if with_services and ws_repo_match and ws_repo_match.services:
+        from .services import parse_services, start_services, wait_for_services, stop_services, collect_test_env
 
-    run_config = RunConfig(
-        path=config.path,
-        command=config.command,
-        description=config.description,
-        ecosystem=config.ecosystem,
-    )
-    exit_code = run_app(run_config)
+        svcs = parse_services(ws_repo_match.services)
+
+        if not quiet and not json_output:
+            svc_names = [s.name for s in svcs]
+            out.info(f"[bold]Starting services:[/bold] {', '.join(svc_names)}")
+
+        start_results = start_services(svcs, project_path=target_path)
+        for r in start_results:
+            if not quiet and not json_output:
+                status = "[green]✓[/green]" if r.success else "[red]✗[/red]"
+                out.info(f"  {status} {r.name}: {r.message}")
+            if not r.success:
+                out.error(f"Failed to start service {r.name}: {r.message}")
+                # Try to clean up
+                stop_services(svcs, project_path=target_path)
+                raise typer.Exit(1)
+
+        # Wait for health
+        if not quiet and not json_output:
+            out.info("[bold]Waiting for services...[/bold]")
+
+        health_results = wait_for_services(svcs, timeout=30)
+        all_healthy = True
+        for r in health_results:
+            if not quiet and not json_output:
+                status = "[green]✓[/green]" if r.success else "[red]✗[/red]"
+                out.info(f"  {status} {r.name}: {r.message}")
+            if not r.success:
+                all_healthy = False
+
+        if not all_healthy:
+            out.error("Some services failed health check")
+            stop_services(svcs, project_path=target_path)
+            raise typer.Exit(1)
+
+        services_started = True
+        service_env = {**collect_test_env(svcs), **ws_repo_match.test_env}
+
+    try:
+        if not quiet and not json_output:
+            out.info(f"\n[bold]{target_path.name}[/bold] [dim]({config.ecosystem})[/dim]")
+            out.info(f"  [bold blue]>[/bold blue] {cmd_str}")
+            if service_env:
+                out.info(f"  [dim]env: {', '.join(f'{k}=...' for k in service_env)}[/dim]")
+
+        # Run tests with injected env
+        import os
+        import subprocess
+        import signal
+        import sys
+
+        env = {**os.environ, **service_env}
+        proc = subprocess.Popen(
+            config.command,
+            cwd=config.path,
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            env=env,
+        )
+
+        def _forward(signum, frame):
+            proc.send_signal(signum)
+
+        old_int = signal.signal(signal.SIGINT, _forward)
+        old_term = signal.signal(signal.SIGTERM, _forward)
+
+        try:
+            exit_code = proc.wait()
+        finally:
+            signal.signal(signal.SIGINT, old_int)
+            signal.signal(signal.SIGTERM, old_term)
+
+    finally:
+        # Stop services
+        if services_started:
+            from .services import parse_services, stop_services
+            svcs = parse_services(ws_repo_match.services)
+            if not quiet and not json_output:
+                out.info(f"\n[bold]Stopping services...[/bold]")
+            stop_results = stop_services(svcs, project_path=target_path)
+            for r in stop_results:
+                if not quiet and not json_output:
+                    status = "[green]✓[/green]" if r.success else "[red]✗[/red]"
+                    out.info(f"  {status} {r.name}: {r.message}")
+
     if exit_code != 0:
         raise typer.Exit(exit_code)
 
