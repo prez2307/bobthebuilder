@@ -13,10 +13,13 @@ MAKE_SETUP_TARGETS = ["install", "setup", "bootstrap", "deps", "dependencies", "
 
 def get_steps_for_context(ctx: ProjectContext, docker_flag: bool = False) -> list[BuildStep]:
     """Generate all build steps for a project context, in correct order."""
+    from ..monorepo import should_skip_subproject_install
+
     steps: list[BuildStep] = []
     has_language_install = False
+    is_workspace_root = should_skip_subproject_install(Path(ctx.root))
 
-    # 1. Env file copying (before anything else)
+    # 1. Env file copying (before anything else) — only root-level env files
     steps.extend(env.get_steps(ctx))
 
     # 2. Root-level language-specific install + build
@@ -33,6 +36,9 @@ def get_steps_for_context(ctx: ProjectContext, docker_flag: bool = False) -> lis
 
     # 3. Subproject steps (ecosystems detected in subdirectories)
     for sub in ctx.subprojects:
+        # Skip Node subpackage installs if root is a workspace (pnpm/yarn/npm handles them)
+        if sub.ecosystem == Ecosystem.NODE and is_workspace_root:
+            continue
         sub_steps = _steps_for_subproject(sub, ctx)
         if sub_steps:
             has_language_install = True

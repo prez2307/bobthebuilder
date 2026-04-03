@@ -247,7 +247,9 @@ def _scan_subdirs(root: Path, max_depth: int = MAX_SUBDIR_DEPTH) -> list[SubProj
                                 sp.env_example_files = env_files
                                 break
 
-                    # Don't recurse deeper into a project subdir
+                    # Continue scanning inside this subproject for OTHER ecosystems
+                    # (e.g., Tauri has Cargo.toml inside a Node package)
+                    _scan(entry, depth + 1)
                     continue
 
                 # Not a project dir, recurse

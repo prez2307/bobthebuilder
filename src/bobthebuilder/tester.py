@@ -36,9 +36,17 @@ class TestConfig:
 
 
 def detect_test_command(project_path: Path) -> TestConfig | None:
-    """Detect how to run tests in the given project directory."""
-    ctx = detect_project(project_path)
+    """Detect how to run tests in the given project directory (first match)."""
+    configs = detect_all_test_commands(project_path)
+    return configs[0] if configs else None
 
+
+def detect_all_test_commands(project_path: Path) -> list[TestConfig]:
+    """Detect ALL test commands across root and subprojects."""
+    ctx = detect_project(project_path)
+    configs: list[TestConfig] = []
+
+    # Root-level test detection
     for ecosystem in ctx.root_ecosystems:
         config = None
         if ecosystem == Ecosystem.NODE:
@@ -52,20 +60,41 @@ def detect_test_command(project_path: Path) -> TestConfig | None:
         elif ecosystem == Ecosystem.RUBY:
             config = _detect_ruby_test(project_path)
         if config:
-            return config
+            configs.append(config)
 
-    # Fallback: Makefile test targets
-    if ctx.makefile_targets:
+    # Subproject test detection
+    for sub in ctx.subprojects:
+        sub_path = project_path / sub.path
+        if sub.ecosystem == Ecosystem.PYTHON:
+            config = _detect_python_test(sub_path, sub)
+            if config:
+                configs.append(config)
+        elif sub.ecosystem == Ecosystem.RUST:
+            config = _detect_rust_test(sub_path)
+            if config:
+                configs.append(config)
+        elif sub.ecosystem == Ecosystem.GO:
+            config = _detect_go_test(sub_path)
+            if config:
+                configs.append(config)
+        elif sub.ecosystem == Ecosystem.RUBY:
+            config = _detect_ruby_test(sub_path)
+            if config:
+                configs.append(config)
+
+    # Fallback: Makefile test targets (only if nothing else found)
+    if not configs and ctx.makefile_targets:
         for target in MAKE_TEST_TARGETS:
             if target in ctx.makefile_targets:
-                return TestConfig(
+                configs.append(TestConfig(
                     path=str(project_path),
                     command=["make", target],
                     description=f"make {target}",
                     ecosystem="make",
-                )
+                ))
+                break
 
-    return None
+    return configs
 
 
 def _detect_node_test(project_path: Path, ctx) -> TestConfig | None:

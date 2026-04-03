@@ -134,7 +134,7 @@ def _read_version_file(path: Path) -> str:
 
 
 def check_repo(repo_path: Path) -> DoctorResult:
-    """Run doctor checks for a single repo."""
+    """Run doctor checks for a single repo (including all subproject ecosystems)."""
     ctx = detect_project(repo_path)
     primary_eco = None
     for eco in ctx.root_ecosystems:
@@ -147,63 +147,93 @@ def check_repo(repo_path: Path) -> DoctorResult:
     eco_name = primary_eco.value if primary_eco else "unknown"
     result = DoctorResult(repo=repo_path.name, ecosystem=eco_name)
 
-    if primary_eco is None:
+    if primary_eco is None and not ctx.subprojects:
         result.warnings.append("No ecosystem detected")
         return result
 
-    # Determine which specific tools are needed
+    # Collect ALL needed tools across root + subprojects
     needed_tools = _tools_needed_for_repo(ctx)
+    checked_tools: set[str] = set()
 
-    # Check tools for this ecosystem
-    tool_checks = TOOL_CHECKS.get(eco_name, [])
-    required = REQUIRED_TOOLS.get(eco_name, set())
+    # Collect all ecosystems to check (root + subprojects)
+    all_eco_names: set[str] = set()
+    if primary_eco:
+        all_eco_names.add(eco_name)
+    for sub in ctx.subprojects:
+        if sub.ecosystem not in (Ecosystem.MAKE, Ecosystem.DOCKER):
+            all_eco_names.add(sub.ecosystem.value)
+            # Add subproject-specific tools to needed set
+            if sub.ecosystem == Ecosystem.PYTHON:
+                needed_tools.add("python")
+                if sub.python_tool and sub.python_tool != "pip":
+                    needed_tools.add(sub.python_tool)
+            elif sub.ecosystem == Ecosystem.RUST:
+                needed_tools.add("cargo")
+                needed_tools.add("rustc")
+            elif sub.ecosystem == Ecosystem.GO:
+                needed_tools.add("go")
+            elif sub.ecosystem == Ecosystem.RUBY:
+                needed_tools.add("ruby")
+                needed_tools.add("bundler")
 
-    for tool_name, version_cmd in tool_checks:
-        # Only check tools that are relevant
-        if tool_name not in needed_tools and tool_name not in required:
-            continue
+    # Check tools across all ecosystems
+    for eco in all_eco_names:
+        tool_checks = TOOL_CHECKS.get(eco, [])
+        required = REQUIRED_TOOLS.get(eco, set())
 
-        version = _get_version(version_cmd)
-        check = ToolCheck(
-            name=tool_name,
-            installed=version is not None,
-            version=version or "",
-            required=tool_name in required or tool_name in needed_tools,
-        )
-        result.checks.append(check)
+        for tool_name, version_cmd in tool_checks:
+            if tool_name in checked_tools:
+                continue
+            if tool_name not in needed_tools and tool_name not in required:
+                continue
 
-    # Check version files
-    for version_file, tool_name in VERSION_FILES.get(eco_name, []):
-        vf_path = repo_path / version_file
-        if vf_path.exists():
-            wanted = _read_version_file(vf_path)
-            if wanted:
-                # Find the matching tool check and annotate it
-                for check in result.checks:
-                    if check.name == tool_name:
-                        check.wanted_version = wanted
-                        break
-
-    # Docker check if docker-compose is present
-    if ctx.has_docker_compose:
-        for tool_name, version_cmd in TOOL_CHECKS.get("docker", []):
             version = _get_version(version_cmd)
-            result.checks.append(ToolCheck(
+            check = ToolCheck(
                 name=tool_name,
                 installed=version is not None,
                 version=version or "",
-                required=True,
-            ))
+                required=tool_name in required or tool_name in needed_tools,
+            )
+            result.checks.append(check)
+            checked_tools.add(tool_name)
 
-    # Add warnings for common issues
-    if eco_name == "node" and not (repo_path / "node_modules").exists():
+    # Check version files
+    for eco in all_eco_names:
+        for version_file, tool_name in VERSION_FILES.get(eco, []):
+            vf_path = repo_path / version_file
+            if vf_path.exists():
+                wanted = _read_version_file(vf_path)
+                if wanted:
+                    for check in result.checks:
+                        if check.name == tool_name:
+                            check.wanted_version = wanted
+                            break
+
+    # Docker check if docker-compose is present
+    if ctx.has_docker_compose and "docker" not in checked_tools:
+        for tool_name, version_cmd in TOOL_CHECKS.get("docker", []):
+            if tool_name not in checked_tools:
+                version = _get_version(version_cmd)
+                result.checks.append(ToolCheck(
+                    name=tool_name,
+                    installed=version is not None,
+                    version=version or "",
+                    required=True,
+                ))
+                checked_tools.add(tool_name)
+
+    # Warnings
+    if "node" in all_eco_names and not (repo_path / "node_modules").exists():
         result.warnings.append("node_modules not found — run 'bob build' first")
-    if eco_name == "python":
+    if "python" in all_eco_names:
         has_venv = (repo_path / ".venv").exists() or (repo_path / "venv").exists()
         if not has_venv and ctx.python_tool not in ("uv", "poetry"):
-            result.warnings.append("No virtual environment found — consider using 'uv' or 'poetry'")
-    if eco_name == "ruby" and not (repo_path / "Gemfile.lock").exists():
-        result.warnings.append("Gemfile.lock not found — run 'bundle install'")
+            # Check subprojects too
+            sub_has_uv_poetry = any(
+                s.python_tool in ("uv", "poetry") for s in ctx.subprojects if s.ecosystem == Ecosystem.PYTHON
+            )
+            if not sub_has_uv_poetry:
+                result.warnings.append("No virtual environment found — consider using 'uv' or 'poetry'")
 
     return result
 

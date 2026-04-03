@@ -203,7 +203,7 @@ def test(
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
 ) -> None:
     """Detect and run tests."""
-    from .tester import detect_test_command
+    from .tester import detect_all_test_commands, detect_test_command
 
     out = Output(json_mode=json_output, quiet=quiet)
     cwd = Path.cwd()
@@ -222,13 +222,12 @@ def test(
         elif len(ws.repos) == 1:
             target_path = (ws_root / ws.repos[0].path).resolve()
         else:
-            # Show all testable repos
+            # Show all testable repos (including subproject ecosystems)
             configs = []
             for ws_repo in ws.repos:
                 rp = (ws_root / ws_repo.path).resolve()
                 if rp.is_dir():
-                    config = detect_test_command(rp)
-                    if config:
+                    for config in detect_all_test_commands(rp):
                         configs.append((ws_repo.path, config))
 
             if json_output:
@@ -254,19 +253,21 @@ def test(
         out.error(f"Directory not found: {target_path}")
         raise typer.Exit(1)
 
-    config = detect_test_command(target_path)
-    if not config:
+    all_configs = detect_all_test_commands(target_path)
+    if not all_configs:
         out.error(f"Could not detect test command for {target_path.name}.")
         raise typer.Exit(1)
 
+    config = all_configs[0]
     cmd_str = " ".join(config.command)
 
     if dry_run:
         if json_output:
-            print(json.dumps(config.to_dict(), indent=2))
+            print(json.dumps({"configs": [c.to_dict() for c in all_configs]}, indent=2))
         else:
-            out.info(f"[bold]{target_path.name}[/bold] [dim]({config.ecosystem})[/dim]")
-            out.info(f"  Would run: [cyan]{cmd_str}[/cyan]")
+            for c in all_configs:
+                out.info(f"[bold]{Path(c.path).name}[/bold] [dim]({c.ecosystem})[/dim]")
+                out.info(f"  Would run: [cyan]{' '.join(c.command)}[/cyan]")
         return
 
     if not quiet and not json_output:

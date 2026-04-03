@@ -48,10 +48,17 @@ class RunConfig:
 
 
 def detect_run_command(project_path: Path) -> RunConfig | None:
-    """Detect how to run the application in the given project directory."""
-    ctx = detect_project(project_path)
+    """Detect how to run the application (first match)."""
+    configs = detect_all_run_commands(project_path)
+    return configs[0] if configs else None
 
-    # Try ecosystem-specific detection in priority order
+
+def detect_all_run_commands(project_path: Path) -> list[RunConfig]:
+    """Detect ALL run commands across root and subprojects."""
+    ctx = detect_project(project_path)
+    configs: list[RunConfig] = []
+
+    # Root-level run detection
     for ecosystem in ctx.root_ecosystems:
         config = None
         if ecosystem == Ecosystem.NODE:
@@ -67,29 +74,45 @@ def detect_run_command(project_path: Path) -> RunConfig | None:
         elif ecosystem == Ecosystem.DOCKER:
             config = _detect_docker_run(project_path)
         if config:
-            return config
+            configs.append(config)
+
+    # Subproject run detection
+    for sub in ctx.subprojects:
+        sub_path = project_path / sub.path
+        config = None
+        if sub.ecosystem == Ecosystem.PYTHON:
+            config = _detect_python_run(sub_path, sub)
+        elif sub.ecosystem == Ecosystem.RUST:
+            config = _detect_rust_run(sub_path)
+        elif sub.ecosystem == Ecosystem.GO:
+            config = _detect_go_run(sub_path)
+        elif sub.ecosystem == Ecosystem.RUBY:
+            config = _detect_ruby_run(sub_path)
+        if config:
+            configs.append(config)
 
     # Fallback: Makefile run targets
-    if ctx.makefile_targets:
+    if not configs and ctx.makefile_targets:
         for target in MAKE_RUN_TARGETS:
             if target in ctx.makefile_targets:
-                return RunConfig(
+                configs.append(RunConfig(
                     path=str(project_path),
                     command=["make", target],
                     description=f"make {target}",
                     ecosystem="make",
-                )
+                ))
+                break
 
     # Fallback: docker compose if present
-    if ctx.has_docker_compose:
-        return RunConfig(
+    if not configs and ctx.has_docker_compose:
+        configs.append(RunConfig(
             path=str(project_path),
             command=["docker", "compose", "up"],
             description="docker compose up",
             ecosystem="docker",
-        )
+        ))
 
-    return None
+    return configs
 
 
 def _detect_node_run(project_path: Path, ctx) -> RunConfig | None:
